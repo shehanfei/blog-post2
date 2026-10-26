@@ -181,9 +181,18 @@ skill_defs <- tribble(
   "Kotlin",           "Kotlin",                        TRUE
 )
 
-count_skill <- function(pattern, ignore_case) {
+# TRUE/FALSE for each posting: does it mention this skill?
+has_skill <- function(pattern, ignore_case) {
   full <- paste0("(?<![A-Za-z0-9])(?:", pattern, ")(?![A-Za-z0-9])")
-  sum(str_detect(jobs_raw$text, regex(full, ignore_case = ignore_case)))
+  str_detect(jobs_raw$text, regex(full, ignore_case = ignore_case))
+}
+
+count_skill <- function(pattern, ignore_case) sum(has_skill(pattern, ignore_case))
+
+# Same check, but by skill name from the table above
+mentions <- function(skill_name) {
+  d <- skill_defs[skill_defs$skill == skill_name, ]
+  has_skill(d$pattern, d$ignore_case)
 }
 
 skill_counts <- skill_defs |>
@@ -194,6 +203,8 @@ skill_counts <- skill_defs |>
 
 skill_counts
 ```
+
+**Note:** every skill is counted separately, so the counts overlap and **must not be added together**. A posting that mentions both "SQL" and "Postgres" counts once for each, and the same holds for "Machine Learning" and "LLM". In particular, "PostgreSQL" ranks well above "SQL" because many ads name only the database (Postgres) and never write the word "SQL". The Interpretation section below de-duplicates these groups where it matters.
 
 ## Step 5: Visualize the Results
 
@@ -241,6 +252,22 @@ cloud <- skill_counts |> filter(skill %in% c("AWS", "GCP", "Azure")) |> arrange(
 ai    <- skill_counts |> filter(skill %in% c("LLM", "Machine Learning", "PyTorch", "TensorFlow"))
 llm_n <- skill_counts$n_postings[skill_counts$skill == "LLM"]
 llm_s <- skill_counts$share_of_postings[skill_counts$skill == "LLM"]
+
+# Overlapping skills: count each POSTING once, not each mention
+ml_only  <- sum(mentions("Machine Learning") & !mentions("LLM"))
+llm_only <- sum(!mentions("Machine Learning") & mentions("LLM"))
+both_ai  <- sum(mentions("Machine Learning") & mentions("LLM"))
+ai_any   <- sum(mentions("Machine Learning") | mentions("LLM") |
+                mentions("PyTorch") | mentions("TensorFlow"))
+
+sql_any  <- sum(mentions("SQL") | mentions("PostgreSQL"))
+sql_only <- sum(mentions("SQL") & !mentions("PostgreSQL"))
+pg_only  <- sum(mentions("PostgreSQL") & !mentions("SQL"))
+sql_both <- sum(mentions("SQL") & mentions("PostgreSQL"))
+
+web_any  <- sum(mentions("TypeScript") | mentions("React") | mentions("JavaScript"))
+
+n_jobs <- nrow(jobs_raw)
 ```
 
 ## Interpreting the Results
@@ -249,8 +276,10 @@ I scraped **`r nrow(jobs_raw)` top-level job postings** from *`r thread_title`* 
 
 Among programming languages, **`r top_language$skill`** appears most often (`r pct(top_language$share_of_postings)` of postings). On the infrastructure side, **`r cloud$skill[1]`** is the most-mentioned cloud platform (`r pct(cloud$share_of_postings[1])`), ahead of `r cloud$skill[2]` (`r pct(cloud$share_of_postings[2])`) and `r cloud$skill[3]` (`r pct(cloud$share_of_postings[3])`). AI-related terms are also visible: "LLM" appears in `r llm_n` postings (`r pct(llm_s)`).
 
+Because one posting can mention several related skills, the individual percentages above should not be added together, so I also count each posting only once per group. **AI/ML:** `r ai_any` postings (`r pct(ai_any / n_jobs)`) mention at least one of Machine Learning, LLM, PyTorch, or TensorFlow; of these, `r both_ai` mention both "Machine Learning" and "LLM", `r ml_only` only "Machine Learning", and `r llm_only` only "LLM". **Databases:** `r sql_any` postings (`r pct(sql_any / n_jobs)`) mention SQL or PostgreSQL; PostgreSQL ranks higher than plain "SQL" because `r pg_only` postings name Postgres without ever writing "SQL", while only `r sql_only` mention SQL without Postgres. **Web:** `r web_any` postings (`r pct(web_any / n_jobs)`) mention TypeScript, React, or JavaScript, which shows how much of this channel is web and full-stack work.
+
 A few caveats limit what this count can tell you. First, HN's hiring thread skews toward startups and technically minded companies, so it is not a representative sample of the whole U.S. labor market the way BLS data would be; it is a snapshot of one fairly technical hiring channel. Second, a skill being *mentioned* is not the same as it being *required*; some ads list a long stack of "nice to haves." Third, keyword matching is crude: a posting that says "we use Go and Rust" counts for both, and a skill not on my list is invisible. Even with those caveats, the relative ranking within this one channel is a reasonable signal of which tools are currently table stakes for a software or data role versus which are more niche.
 
 ## Takeaway
 
-If you are deciding what to spend your next few weeks of self-study on, this month's data points to **`r top5$skill[1]`** and **`r top5$skill[2]`** as the most requested skills in this channel, with **`r top5$skill[3]`** close behind, so they are a defensible, if imperfect, place to start. The analysis pulls the current month's thread automatically, so re-running it next month or next year will show whether this ranking is actually shifting, rather than repeating today's answer forever.
+If you are deciding what to spend your next few weeks of self-study on, this month's data points to **`r top5$skill[1]`** and **`r top5$skill[2]`** as the most requested skills in this channel, with **`r top5$skill[3]`** close behind, so they are a defensible, if imperfect, place to start. The pattern behind the ranking matters more than any single tool: about `r pct(web_any / n_jobs)` of postings ask for web skills (TypeScript, React, or JavaScript), `r pct(sql_any / n_jobs)` ask for a relational database (SQL or PostgreSQL), and `r pct(ai_any / n_jobs)` mention AI/ML, so a profile that combines one general-purpose language, a database, and some exposure to AI tools matches the largest share of what this channel is hiring for. The analysis pulls the current month's thread automatically, so re-running it next month or next year will show whether this ranking is actually shifting, rather than repeating today's answer forever.

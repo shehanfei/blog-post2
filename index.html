@@ -1696,9 +1696,18 @@ otherwise “go to market” would count as the Go language.</p>
   &quot;Kotlin&quot;,           &quot;Kotlin&quot;,                        TRUE
 )
 
-count_skill &lt;- function(pattern, ignore_case) {
+# TRUE/FALSE for each posting: does it mention this skill?
+has_skill &lt;- function(pattern, ignore_case) {
   full &lt;- paste0(&quot;(?&lt;![A-Za-z0-9])(?:&quot;, pattern, &quot;)(?![A-Za-z0-9])&quot;)
-  sum(str_detect(jobs_raw$text, regex(full, ignore_case = ignore_case)))
+  str_detect(jobs_raw$text, regex(full, ignore_case = ignore_case))
+}
+
+count_skill &lt;- function(pattern, ignore_case) sum(has_skill(pattern, ignore_case))
+
+# Same check, but by skill name from the table above
+mentions &lt;- function(skill_name) {
+  d &lt;- skill_defs[skill_defs$skill == skill_name, ]
+  has_skill(d$pattern, d$ignore_case)
 }
 
 skill_counts &lt;- skill_defs |&gt;
@@ -1722,6 +1731,13 @@ skill_counts</code></pre>
 ##  9 Rust                     22            0.0843
 ## 10 Go                       21            0.0805
 ## # ℹ 16 more rows</code></pre>
+<p><strong>Note:</strong> every skill is counted separately, so the
+counts overlap and <strong>must not be added together</strong>. A
+posting that mentions both “SQL” and “Postgres” counts once for each,
+and the same holds for “Machine Learning” and “LLM”. In particular,
+“PostgreSQL” ranks well above “SQL” because many ads name only the
+database (Postgres) and never write the word “SQL”. The Interpretation
+section below de-duplicates these groups where it matters.</p>
 </div>
 <div id="step-5-visualize-the-results" class="section level2">
 <h2>Step 5: Visualize the Results</h2>
@@ -1767,6 +1783,17 @@ often (25% of postings). On the infrastructure side,
 <strong>AWS</strong> is the most-mentioned cloud platform (12%), ahead
 of GCP (3%) and Azure (2%). AI-related terms are also visible: “LLM”
 appears in 34 postings (13%).</p>
+<p>Because one posting can mention several related skills, the
+individual percentages above should not be added together, so I also
+count each posting only once per group. <strong>AI/ML:</strong> 62
+postings (24%) mention at least one of Machine Learning, LLM, PyTorch,
+or TensorFlow; of these, 9 mention both “Machine Learning” and “LLM”, 27
+only “Machine Learning”, and 25 only “LLM”. <strong>Databases:</strong>
+57 postings (22%) mention SQL or PostgreSQL; PostgreSQL ranks higher
+than plain “SQL” because 40 postings name Postgres without ever writing
+“SQL”, while only 9 mention SQL without Postgres. <strong>Web:</strong>
+77 postings (30%) mention TypeScript, React, or JavaScript, which shows
+how much of this channel is web and full-stack work.</p>
 <p>A few caveats limit what this count can tell you. First, HN’s hiring
 thread skews toward startups and technically minded companies, so it is
 not a representative sample of the whole U.S. labor market the way BLS
@@ -1785,10 +1812,15 @@ software or data role versus which are more niche.</p>
 on, this month’s data points to <strong>Python</strong> and
 <strong>TypeScript</strong> as the most requested skills in this
 channel, with <strong>React</strong> close behind, so they are a
-defensible, if imperfect, place to start. The analysis pulls the current
-month’s thread automatically, so re-running it next month or next year
-will show whether this ranking is actually shifting, rather than
-repeating today’s answer forever.</p>
+defensible, if imperfect, place to start. The pattern behind the ranking
+matters more than any single tool: about 30% of postings ask for web
+skills (TypeScript, React, or JavaScript), 22% ask for a relational
+database (SQL or PostgreSQL), and 24% mention AI/ML, so a profile that
+combines one general-purpose language, a database, and some exposure to
+AI tools matches the largest share of what this channel is hiring for.
+The analysis pulls the current month’s thread automatically, so
+re-running it next month or next year will show whether this ranking is
+actually shifting, rather than repeating today’s answer forever.</p>
 </div>
 
 
