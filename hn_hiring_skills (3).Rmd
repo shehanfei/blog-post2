@@ -1,0 +1,256 @@
+---
+title: "What Tech Skills Are Companies Actually Asking For? Scraping Hacker News's 'Who Is Hiring' Thread"
+author: "Your Name"
+date: "2026-10-26"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+knit: (function(input, ...) { rmarkdown::render(input, output_file = "index.html") })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(rvest)
+library(httr2)
+library(here)
+```
+
+## Why This Question Matters
+
+If you are a student picking which languages or tools to learn next, or a bootcamp grad deciding where to focus your last few weeks of prep, the honest answer to "what should I learn?" usually comes from someone's personal impression of the job market rather than from data. Job boards like LinkedIn or Indeed are largely closed to scraping and heavily curated by algorithms that decide what you see.
+
+Hacker News runs a different kind of job board: once a month, an automated post titled **"Ask HN: Who is hiring?"** invites companies to post an open role directly as a comment, with no algorithm ranking, hiding, or paywalling the results. Every comment is public, plain-text, and follows a loose community convention (location, remote/on-site, and enough detail about the role that a technical reader can decide whether to apply). That makes it an unusually clean, real-world source for asking: **which technical skills come up most often in real job postings this month, and what does that suggest about where to spend your learning time?**
+
+## Data Source and Ethical Considerations
+
+Hacker News is a public forum with no login wall on its content, and its `robots.txt` does not block crawling of comment pages. The threads themselves explicitly invite public commentary and analysis of hiring trends. To stay within good scraping practice:
+
+- I request each comment page **once**, pause between requests, and save a raw HTML snapshot, so re-running the analysis re-reads the saved files instead of hitting the site again.
+- I only collect **already-public text** that companies voluntarily posted to be seen; no personal profile data, emails, or private information is collected beyond what a company chose to put in its own job ad.
+- I identify my scraper with a User-Agent string, and I record the source URL and the date I accessed it, per the reproducibility practices from class.
+
+## Step 1: Find the Current Thread Automatically
+
+Rather than hard-coding a specific month's URL, I use Hacker News's public Algolia search API (an official, documented endpoint, not scraping) only to look up the **ID** of the most recent "Who is hiring?" post. The search also returns the monthly "Who wants to be hired?" and "Freelancer?" threads, so I filter by title to make sure I pick the right one. The data collection itself in Step 2 is done with `rvest` on the HTML comment pages.
+
+```{r find-thread}
+RAW_DIR <- here("data", "raw")
+RESULTS_DIR <- here("results")
+dir.create(RAW_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(RESULTS_DIR, recursive = TRUE, showWarnings = FALSE)
+
+UA <- "Course project scraper (student, low-volume, 1 thread/month)"
+
+search_result <- request("https://hn.algolia.com/api/v1/search_by_date") |>
+  req_url_query(tags = "story,author_whoishiring", hitsPerPage = 20) |>
+  req_user_agent(UA) |>
+  req_retry(max_tries = 3) |>
+  req_perform() |>
+  resp_body_json()
+
+hits <- search_result$hits
+is_hiring <- map_lgl(hits, ~ str_detect(.x$title, regex("who is hiring", ignore_case = TRUE)))
+stopifnot("No 'Who is hiring?' thread found in the API results" = any(is_hiring))
+
+latest <- hits[is_hiring][[1]]
+thread_id    <- latest$objectID
+thread_title <- latest$title
+thread_url   <- paste0("https://news.ycombinator.com/item?id=", thread_id)
+
+thread_title
+thread_url
+```
+
+## Step 2: Read the Thread with rvest and Save Raw Snapshots
+
+The thread has hundreds of comments, and Hacker News splits them across several pages (`&p=1`, `&p=2`, ...). The loop below reads page after page until a page has no comments. Each page is saved to disk; if a snapshot already exists, it is re-used.
+
+```{r read-pages}
+read_hn_page <- function(thread_id, p) {
+  f <- file.path(RAW_DIR, paste0("hn_hiring_", thread_id, "_p", p, ".html"))
+  if (!file.exists(f)) {
+    resp <- request("https://news.ycombinator.com/item") |>
+      req_url_query(id = thread_id, p = p) |>
+      req_user_agent(UA) |>
+      req_retry(max_tries = 3) |>
+      req_perform()
+    writeLines(resp_body_string(resp), f)
+    Sys.sleep(2)  # be polite between requests
+  }
+  read_html(f)
+}
+
+pages <- list()
+seen_ids <- character()
+for (p in 1:15) {
+  pg <- read_hn_page(thread_id, p)
+  ids <- pg |> html_elements("tr.athing.comtr") |> html_attr("id")
+  new_ids <- setdiff(ids, seen_ids)
+  if (length(new_ids) == 0) break   # empty page, or a repeat of an earlier page
+  seen_ids <- c(seen_ids, new_ids)
+  pages[[p]] <- pg
+}
+
+length(pages)
+```
+
+## Step 3: Extract Only Top-Level Job Postings
+
+Hacker News nests replies under each comment. A reply asking "is this remote?" is not a job posting, so I keep only **top-level** comments, the ones written directly by a hiring company. HN marks each comment's nesting depth with an `indent` attribute on a small table cell (`td.ind`), so I filter on that rather than guessing from comment length.
+
+Note that the comment text lives in an element with class `commtext` (currently a `div`), so I select by class only, which keeps the code working if the tag name changes.
+
+```{r extract-jobs}
+parse_page <- function(pg) {
+  rows <- html_elements(pg, "tr.athing.comtr")
+
+  indent_level <- rows |>
+    html_element("td.ind") |>
+    html_attr("indent") |>
+    as.numeric()
+
+  # Fallback: older layout stores depth in the spacer image width (40px per level)
+  if (all(is.na(indent_level))) {
+    indent_level <- rows |>
+      html_element("td.ind img") |>
+      html_attr("width") |>
+      as.numeric() / 40
+  }
+
+  tibble(
+    comment_id = html_attr(rows, "id"),
+    indent     = indent_level,
+    text       = rows |> html_element(".commtext") |> html_text2()
+  )
+}
+
+all_comments <- map_dfr(pages, parse_page)
+
+jobs_raw <- all_comments |>
+  filter(indent == 0, !is.na(text), str_length(text) > 100) |>
+  distinct(comment_id, .keep_all = TRUE)
+
+# Sanity checks: stop knitting if scraping silently failed
+stopifnot("No comments were scraped: check the URL, selectors, or the raw HTML files" = nrow(all_comments) > 0)
+stopifnot("No top-level job postings after filtering: check the 'indent' logic" = nrow(jobs_raw) > 0)
+
+tibble(
+  all_comments_scraped = nrow(all_comments),
+  top_level_job_postings = nrow(jobs_raw)
+)
+```
+
+Filtering to `indent == 0` keeps only the original postings; the `str_length` check drops a handful of near-empty or deleted comments that occasionally remain in the thread.
+
+## Step 4: Clean the Text and Count Skill Mentions
+
+Job ads are free text, so "which skills are requested" has to be defined operationally. I build a list of common technical skill keywords and, for each posting, check whether the keyword appears as a **whole word** (so "Java" does not match inside "JavaScript", and "R" would not match inside "Restaurant").
+
+Two details matter here. First, a normal `\b` word boundary fails for names ending in symbols such as "C++", so I use "not preceded/followed by a letter or digit" instead. Second, short names that are also ordinary English words ("Go", "Rust", "Swift", "Node", "Rails", "Azure") are matched **case-sensitively**, otherwise "go to market" would count as the Go language.
+
+```{r count-skills}
+skill_defs <- tribble(
+  ~skill,             ~pattern,                        ~ignore_case,
+  "Python",           "Python",                        TRUE,
+  "JavaScript",       "JavaScript",                    TRUE,
+  "TypeScript",       "TypeScript",                    TRUE,
+  "Java",             "Java",                          FALSE,
+  "Go",               "Go(lang)?",                     FALSE,
+  "Rust",             "Rust",                          FALSE,
+  "C++",              "C\\+\\+",                       TRUE,
+  "SQL",              "SQL",                           TRUE,
+  "React",            "React(\\.js|JS)?",              FALSE,
+  "Node",             "Node(\\.js|JS)?",               FALSE,
+  "AWS",              "AWS",                           FALSE,
+  "GCP",              "GCP",                           FALSE,
+  "Azure",            "Azure",                         FALSE,
+  "Docker",           "Docker",                        TRUE,
+  "Kubernetes",       "Kubernetes|K8s",                TRUE,
+  "Ruby",             "Ruby",                          FALSE,
+  "Rails",            "Rails",                         FALSE,
+  "Django",           "Django",                        TRUE,
+  "PostgreSQL",       "Postgres(QL)?",                 TRUE,
+  "MongoDB",          "Mongo(DB)?",                    TRUE,
+  "Machine Learning", "Machine Learning|\\bML\\b",     TRUE,
+  "PyTorch",          "PyTorch",                       TRUE,
+  "TensorFlow",       "TensorFlow",                    TRUE,
+  "LLM",              "LLMs?",                         FALSE,
+  "Swift",            "Swift",                         FALSE,
+  "Kotlin",           "Kotlin",                        TRUE
+)
+
+count_skill <- function(pattern, ignore_case) {
+  full <- paste0("(?<![A-Za-z0-9])(?:", pattern, ")(?![A-Za-z0-9])")
+  sum(str_detect(jobs_raw$text, regex(full, ignore_case = ignore_case)))
+}
+
+skill_counts <- skill_defs |>
+  mutate(n_postings = map2_int(pattern, ignore_case, count_skill)) |>
+  select(skill, n_postings) |>
+  arrange(desc(n_postings)) |>
+  mutate(share_of_postings = n_postings / nrow(jobs_raw))
+
+skill_counts
+```
+
+## Step 5: Visualize the Results
+
+```{r plot, fig.width=8, fig.height=6}
+skill_counts |>
+  slice_max(n_postings, n = 15, with_ties = FALSE) |>
+  ggplot(aes(x = reorder(skill, n_postings), y = n_postings)) +
+  geom_col(fill = "#2c3e50") +
+  geom_text(aes(label = scales::percent(share_of_postings, accuracy = 1)),
+            hjust = -0.15, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Most-Requested Technical Skills in the Current\nHN 'Who Is Hiring' Thread",
+    subtitle = paste0("Based on ", nrow(jobs_raw), " top-level job postings, scraped ", Sys.Date(),
+                      " (labels = share of postings)"),
+    x = NULL,
+    y = "Number of job postings mentioning this skill"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Step 6: Save the Cleaned Data and Provenance
+
+```{r save}
+skill_counts |>
+  mutate(
+    source           = thread_title,
+    source_url       = thread_url,
+    n_postings_total = nrow(jobs_raw),
+    accessed_at      = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+  ) |>
+  write.csv(here("results", "skill_counts.csv"), row.names = FALSE)
+```
+
+```{r summary-objects, include=FALSE}
+top5 <- skill_counts |> slice_max(n_postings, n = 5, with_ties = FALSE)
+pct  <- function(x) scales::percent(x, accuracy = 1)
+
+top_language <- skill_counts |>
+  filter(skill %in% c("Python", "JavaScript", "TypeScript", "Java", "Go", "Rust", "C++", "Ruby", "Swift", "Kotlin")) |>
+  slice_max(n_postings, n = 1, with_ties = FALSE)
+
+cloud <- skill_counts |> filter(skill %in% c("AWS", "GCP", "Azure")) |> arrange(desc(n_postings))
+ai    <- skill_counts |> filter(skill %in% c("LLM", "Machine Learning", "PyTorch", "TensorFlow"))
+llm_n <- skill_counts$n_postings[skill_counts$skill == "LLM"]
+llm_s <- skill_counts$share_of_postings[skill_counts$skill == "LLM"]
+```
+
+## Interpreting the Results
+
+I scraped **`r nrow(jobs_raw)` top-level job postings** from *`r thread_title`* (accessed `r Sys.Date()`). The five most frequently mentioned skills are **`r top5$skill[1]`** (`r top5$n_postings[1]` postings, `r pct(top5$share_of_postings[1])`), **`r top5$skill[2]`** (`r pct(top5$share_of_postings[2])`), **`r top5$skill[3]`** (`r pct(top5$share_of_postings[3])`), **`r top5$skill[4]`** (`r pct(top5$share_of_postings[4])`), and **`r top5$skill[5]`** (`r pct(top5$share_of_postings[5])`).
+
+Among programming languages, **`r top_language$skill`** appears most often (`r pct(top_language$share_of_postings)` of postings). On the infrastructure side, **`r cloud$skill[1]`** is the most-mentioned cloud platform (`r pct(cloud$share_of_postings[1])`), ahead of `r cloud$skill[2]` (`r pct(cloud$share_of_postings[2])`) and `r cloud$skill[3]` (`r pct(cloud$share_of_postings[3])`). AI-related terms are also visible: "LLM" appears in `r llm_n` postings (`r pct(llm_s)`).
+
+A few caveats limit what this count can tell you. First, HN's hiring thread skews toward startups and technically minded companies, so it is not a representative sample of the whole U.S. labor market the way BLS data would be; it is a snapshot of one fairly technical hiring channel. Second, a skill being *mentioned* is not the same as it being *required*; some ads list a long stack of "nice to haves." Third, keyword matching is crude: a posting that says "we use Go and Rust" counts for both, and a skill not on my list is invisible. Even with those caveats, the relative ranking within this one channel is a reasonable signal of which tools are currently table stakes for a software or data role versus which are more niche.
+
+## Takeaway
+
+If you are deciding what to spend your next few weeks of self-study on, this month's data points to **`r top5$skill[1]`** and **`r top5$skill[2]`** as the most requested skills in this channel, with **`r top5$skill[3]`** close behind, so they are a defensible, if imperfect, place to start. The analysis pulls the current month's thread automatically, so re-running it next month or next year will show whether this ranking is actually shifting, rather than repeating today's answer forever.
